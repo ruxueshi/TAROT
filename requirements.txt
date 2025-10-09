@@ -1,0 +1,4 @@
+pandas
+scikit-learn
+loguru
+transformers==4.24.0
