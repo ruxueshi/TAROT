@@ -24,7 +24,8 @@ python CoD.py --data [NAME_OF_DATASET] --shot [NUMBER_OF_FEW-SHOT_TABULAR_DATA_E
 
 3. Then, the running examples on small-scale tabular datasets and large-scale tabular datasets are as follows:
 ```
-python main_CoDTab_Small-scale.py --data [NAME_OF_DATASET] --layer [LAYER_OF_GCN]
-python main_CoDTab_Large-scale.py --data [NAME_OF_DATASET] --layer [LAYER_OF_GCN] --shot [NUMBER_OF_SAMPLES]
+python main_CoDTab_Large-scale.py --data [NAME_OF_DATASET] --layer [LAYER_OF_GCN]
+python main_CoDTab_Small-scale.py --data [NAME_OF_DATASET] --layer [LAYER_OF_GCN] --shot [NUMBER_OF_SAMPLES]
 
 ```
+
