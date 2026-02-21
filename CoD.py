@@ -7,7 +7,7 @@ from utils import *
 from utils_llm import *
 
 
-openai_key = "YOUR_OPENAI_KEY"
+openai_key = "YOUR API KEY"
 openai.default_headers = {"x-foo": "true"}
 os.environ["OPENAI_API_KEY"] = openai_key
 
@@ -21,9 +21,9 @@ def random_seed(seed):
 
 def parse_args():
     parser = argparse.ArgumentParser(description='adapter')
-    parser.add_argument('--data', type=str, default=f"adult")
+    parser.add_argument('--data', type=str, default=f"heart")
     parser.add_argument('--shot', type=int, default=4)
-    parser.add_argument('--seed', type=int, default=0)
+    parser.add_argument('--seed', type=int, default=1024)
     args = parser.parse_args()
 
     return args
@@ -69,12 +69,6 @@ for columns_name in columns_names:
             prompt += meta_data[key] + "\n"
 
 prompt += "\nSamples:\n" + NAME_COLS
-for row in data.values:
-    row_str = ""
-    for value in row:
-        row_str += str(value) + ","
-    prompt += row_str +"\n"
-prompt += "\n"
 
 instruction = fr"""Step 1. Analyze all the causal relationship or tendency between features based on general knowledge and common sense within a short sentence to answer the task.
 Step 2. Based on the above samples and Step 1’s results, generate a tensor with [{len(data.columns) - 1}, {len(data.columns) - 1}], which represents the relationships between features that contribute to solving the task when analyzed from different perspectives, one perspective is Feature-to-feature dependency (e.g., feature a ↔ feature b), the other is combined or derived effects (e.g., feature a + feature b ↔ task). If a relationship exists, it is assigned a value of 1; otherwise, it is assigned a value of 0.
@@ -95,15 +89,16 @@ combined = [...]
 for i, j in combined:
     tensor[i, j] = tensor[j, i] = 1
 
-np.save(r"data\graph1\{args.data}_{args.seed}_{args.shot}_graph", tensor)
+np.save(r"data\graph\{args.data}_{args.seed}_graph", tensor)
 """
 
+# np.save(r"data\graph\{args.data}_{args.seed}_{args.shot}_graph", tensor)
 prompt += instruction
 
 text = query_gpt(prompt, openai_key, max_tokens=30, temperature=0, max_try_num=10, model="gpt-4o-mini")
 
 
-finally_end = fr'np.save(r"data\graph1\{args.data}_{args.seed}_{args.shot}_graph", tensor)'
+finally_end = fr'np.save(r"data\graph\{args.data}_{args.seed}_graph", tensor)'
 text = text.split('import numpy as np')[-1]
 text = text.split(finally_end)[0]
 text = "import numpy as np\n\n" + text + "\n" + finally_end
