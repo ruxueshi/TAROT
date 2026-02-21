@@ -696,21 +696,103 @@ class CoDTab(CoDTabModel_graph):
         self.num_class = num_class
         self.linear = nn.Linear(hidden_dim, hidden_dim)
         self.clf = CoDTabLinearClassifier(num_class=num_class, hidden_dim=hidden_dim)
+        self.edge_mlp = nn.Sequential(
+        nn.Linear(4 * hidden_dim, hidden_dim),
+        nn.ReLU(),
+        nn.Linear(hidden_dim, 1)
+        )
+
         self.to(device)
 
     def gcn(self, data, adj):
         eye = torch.eye(*adj.shape).cuda()
-        adj = adj+eye
+        adj = adj + eye
         adj = adj > 0
+        adj, Lprior, Lsparse = self.refine_adj(data, adj, topk=4)
         adj = adj.long()
-        adj = adj/(adj.sum(1).unsqueeze(1)+1e-9)
+        adj = adj / (adj.sum(2).unsqueeze(2) + 1e-9)
         for i in range(self.gcn_layer):
-            data = torch.matmul(adj.unsqueeze(0), data)
+            data = torch.matmul(adj, data)
             data = torch.relu(self.linear(data))
+        return data, Lprior, Lsparse
 
-        return data
+    def refine_adj(
+            self,
+            H: torch.Tensor,  # [B, N, D]
+            A0: torch.Tensor,  # [N,N] or [1,N,N] or [B,N,N] 0/1
+            topk: int = 4,
+            prune_policy: str = "threshold",  # "topk" or "threshold"
+            k_prune: int = 4,
+            tau: float = 0.1,
+            lambda_prior: float = 1.0,
+            lambda_sparse: float = 1.0,
+            use_knn_candidates: bool = True,
+    ):
+        device = H.device
+        B, N, D = H.shape
 
-    def forward(self, x, target, adj_list, y=None, table_flag=0):
+        if A0.dim() == 2:
+            A0_b = A0.unsqueeze(0).expand(B, -1, -1)
+        elif A0.dim() == 3 and A0.size(0) == 1:
+            A0_b = A0.expand(B, -1, -1)
+        elif A0.dim() == 3 and A0.size(0) == B:
+            A0_b = A0
+        else:
+            raise ValueError(f"Unexpected A0 shape: {A0.shape}, expected [N,N] / [1,N,N] / [B,N,N]")
+
+        A0_b = A0_b.to(device)
+        llm_mask = (A0_b > 0)  # [B,N,N] LLM
+
+        cand_mask = llm_mask.clone()
+        if use_knn_candidates and topk and topk > 0:
+            k = min(topk, N)
+            # Hn = F.normalize(H, dim=-1)
+            # score = torch.matmul(Hn, Hn.transpose(1, 2))  # [B,N,N]
+
+            Hi = H.unsqueeze(2).expand(B, N, N, D)
+            Hj = H.unsqueeze(1).expand(B, N, N, D)
+            feat = torch.cat([Hi, Hj, Hi * Hj, (Hi - Hj).abs()], dim=-1)  # [B,N,N,4D]
+
+            score = self.edge_mlp(feat).squeeze(-1)  # [B,N,N] logits
+            score = score.float()
+            score_sig = torch.sigmoid(score)
+            knn_idx = score_sig.topk(k=k, dim=-1).indices  # [B,N,k]
+
+            knn_mask = torch.zeros((B, N, N), device=device, dtype=torch.bool)
+            knn_mask.scatter_(2, knn_idx, True)
+            cand_mask = cand_mask | knn_mask
+        if prune_policy == "threshold":
+            hard = (score_sig > tau).float()
+        else:
+            raise ValueError(f"Unknown prune_policy: {prune_policy}, use 'threshold' or 'topk'")
+
+        w_st = (hard - score_sig).detach() + score_sig
+        A = cand_mask * w_st
+        if A.any():
+            Lsparse = score_sig[A.long()].mean()
+        else:
+            Lsparse = torch.tensor(0.0, device=device)
+
+        eye = torch.eye(N, device=device).unsqueeze(0).expand(B, -1, -1)
+        eye_bool = eye.bool()
+        llm_pos_mask = llm_mask & (~eye_bool)
+        if llm_pos_mask.any():
+            s_pos = score[llm_pos_mask]  # logits
+            y_pos = torch.ones_like(s_pos)  # target=1
+            Lprior = F.binary_cross_entropy_with_logits(s_pos, y_pos, reduction='mean')
+        else:
+            Lprior = torch.tensor(0.0, device=device)
+
+        aux = {
+            "score": score_sig,
+            "hard": hard,
+            "cand_mask": cand_mask,
+            "llm_mask": llm_mask,
+        }
+
+        return A, Lprior, Lsparse
+
+    def forward(self, x, target, adj, y=None, table_flag=0):
         encoder_output2 = None
         if isinstance(x, dict):
             # input is the pre-tokenized encoded inputs
@@ -724,9 +806,10 @@ class CoDTab(CoDTabModel_graph):
         outputs, other_info = self.input_encoder.feature_processor(**inputs)
 
         encoder_list = []
-        for adj in adj_list:
-            encoder_output = self.gcn(outputs['embedding'], adj)
-            encoder_list.append(encoder_output)
+
+        encoder_output, Lprior, Lsparse = self.gcn(outputs['embedding'], adj)
+        encoder_list.append(encoder_output)
+
         encoder_output = torch.stack(encoder_list, dim=0)
         encoder_output = encoder_output.mean(0)
         encoder_output = encoder_output.mean(1)
@@ -734,4 +817,4 @@ class CoDTab(CoDTabModel_graph):
 
         logits = self.clf(encoder_output)
 
-        return logits
+        return logits, Lprior, Lsparse
