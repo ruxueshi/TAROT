@@ -1,3 +1,4 @@
+[![DOI](https://zenodo.org/badge/1070477604.svg)](https://doi.org/10.5281/zenodo.20482614)
 <div align="center">
   <h2>TAROT: Task-Adaptive Refinement of LLM-prior Graphs for Few-shot Tabular Learning</h2>
 </div>
