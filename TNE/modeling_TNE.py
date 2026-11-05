@@ -716,20 +716,97 @@ class CoDTab(CoDTabModel_graph):
             data = torch.relu(self.linear(data))
         return data, Lprior, Lsparse
 
+    # def refine_adj(
+    #         self,
+    #         H: torch.Tensor,  # [B, N, D]
+    #         A0: torch.Tensor,  # [N,N] or [1,N,N] or [B,N,N] 0/1
+    #         topk: int = 4,
+    #         prune_policy: str = "threshold",  # "topk" or "threshold"
+    #         k_prune: int = 4,
+    #         tau: float = 0.1,
+    #         lambda_prior: float = 1.0,
+    #         lambda_sparse: float = 1.0,
+    #         use_knn_candidates: bool = True,
+    # ):
+    #     device = H.device
+    #     B, N, D = H.shape
+
+    #     if A0.dim() == 2:
+    #         A0_b = A0.unsqueeze(0).expand(B, -1, -1)
+    #     elif A0.dim() == 3 and A0.size(0) == 1:
+    #         A0_b = A0.expand(B, -1, -1)
+    #     elif A0.dim() == 3 and A0.size(0) == B:
+    #         A0_b = A0
+    #     else:
+    #         raise ValueError(f"Unexpected A0 shape: {A0.shape}, expected [N,N] / [1,N,N] / [B,N,N]")
+
+    #     A0_b = A0_b.to(device)
+    #     llm_mask = (A0_b > 0)  # [B,N,N] LLM
+
+    #     cand_mask = llm_mask.clone()
+    #     if use_knn_candidates and topk and topk > 0:
+    #         k = min(topk, N)
+    #         # Hn = F.normalize(H, dim=-1)
+    #         # score = torch.matmul(Hn, Hn.transpose(1, 2))  # [B,N,N]
+
+    #         Hi = H.unsqueeze(2).expand(B, N, N, D)
+    #         Hj = H.unsqueeze(1).expand(B, N, N, D)
+    #         feat = torch.cat([Hi, Hj, Hi * Hj, (Hi - Hj).abs()], dim=-1)  # [B,N,N,4D]
+
+    #         score = self.edge_mlp(feat).squeeze(-1)  # [B,N,N] logits
+    #         score = score.float()
+    #         score_sig = torch.sigmoid(score)
+    #         knn_idx = score_sig.topk(k=k, dim=-1).indices  # [B,N,k]
+
+    #         knn_mask = torch.zeros((B, N, N), device=device, dtype=torch.bool)
+    #         knn_mask.scatter_(2, knn_idx, True)
+    #         cand_mask = cand_mask | knn_mask
+    #     if prune_policy == "threshold":
+    #         hard = (score_sig > tau).float()
+    #     else:
+    #         raise ValueError(f"Unknown prune_policy: {prune_policy}, use 'threshold' or 'topk'")
+
+    #     w_st = (hard - score_sig).detach() + score_sig
+    #     A = cand_mask * w_st
+    #     if A.any():
+    #         Lsparse = score_sig[A.long()].mean()
+    #     else:
+    #         Lsparse = torch.tensor(0.0, device=device)
+
+    #     eye = torch.eye(N, device=device).unsqueeze(0).expand(B, -1, -1)
+    #     eye_bool = eye.bool()
+    #     llm_pos_mask = llm_mask & (~eye_bool)
+    #     if llm_pos_mask.any():
+    #         s_pos = score[llm_pos_mask]  # logits
+    #         y_pos = torch.ones_like(s_pos)  # target=1
+    #         Lprior = F.binary_cross_entropy_with_logits(s_pos, y_pos, reduction='mean')
+    #     else:
+    #         Lprior = torch.tensor(0.0, device=device)
+
+    #     aux = {
+    #         "score": score_sig,
+    #         "hard": hard,
+    #         "cand_mask": cand_mask,
+    #         "llm_mask": llm_mask,
+    #     }
+
+    #     return A, Lprior, Lsparse
+
     def refine_adj(
-            self,
-            H: torch.Tensor,  # [B, N, D]
-            A0: torch.Tensor,  # [N,N] or [1,N,N] or [B,N,N] 0/1
-            topk: int = 4,
-            prune_policy: str = "threshold",  # "topk" or "threshold"
-            k_prune: int = 4,
-            tau: float = 0.1,
-            lambda_prior: float = 1.0,
-            lambda_sparse: float = 1.0,
-            use_knn_candidates: bool = True,
+        self,
+        H: torch.Tensor,   # [B, N, D]
+        A0: torch.Tensor,  # [N, N] / [1, N, N] / [B, N, N]
+        topk: int = 4,
+        prune_policy: str = "threshold",
+        k_prune: int = 4,
+        tau: float = 0.1,
+        lambda_prior: float = 1.0,
+        lambda_sparse: float = 1.0,
+        use_knn_candidates: bool = True,
     ):
-        device = H.device
-        B, N, D = H.shape
+        from torch.utils.checkpoint import checkpoint
+
+        B, N, _ = H.shape
 
         if A0.dim() == 2:
             A0_b = A0.unsqueeze(0).expand(B, -1, -1)
@@ -738,59 +815,62 @@ class CoDTab(CoDTabModel_graph):
         elif A0.dim() == 3 and A0.size(0) == B:
             A0_b = A0
         else:
-            raise ValueError(f"Unexpected A0 shape: {A0.shape}, expected [N,N] / [1,N,N] / [B,N,N]")
+            raise ValueError(
+                f"Unexpected A0 shape: {A0.shape}, "
+                "expected [N,N] / [1,N,N] / [B,N,N]"
+            )
 
-        A0_b = A0_b.to(device)
-        llm_mask = (A0_b > 0)  # [B,N,N] LLM
+        llm_mask = A0_b.to(H.device) > 0
+
+        def score_rows(rows, nodes):
+            left = rows.unsqueeze(2).expand(-1, -1, N, -1)
+            right = nodes.unsqueeze(1).expand(-1, rows.size(1), -1, -1)
+            features = torch.cat(
+                [left, right, left * right, (left - right).abs()],
+                dim=-1,
+            )
+            return self.edge_mlp(features).squeeze(-1).float()
+
+        blocks = []
+        for rows in H.split(16, dim=1):
+            if torch.is_grad_enabled():
+                logits = checkpoint(score_rows, rows, H, use_reentrant=False)
+            else:
+                logits = score_rows(rows, H)
+            blocks.append(logits)
+
+        score = torch.cat(blocks, dim=1)  # [B, N, N]
+        score_sig = score.sigmoid()
 
         cand_mask = llm_mask.clone()
         if use_knn_candidates and topk and topk > 0:
-            k = min(topk, N)
-            # Hn = F.normalize(H, dim=-1)
-            # score = torch.matmul(Hn, Hn.transpose(1, 2))  # [B,N,N]
+            indices = score_sig.topk(min(topk, N), dim=-1).indices
+            cand_mask.scatter_(2, indices, True)
 
-            Hi = H.unsqueeze(2).expand(B, N, N, D)
-            Hj = H.unsqueeze(1).expand(B, N, N, D)
-            feat = torch.cat([Hi, Hj, Hi * Hj, (Hi - Hj).abs()], dim=-1)  # [B,N,N,4D]
+        if prune_policy != "threshold":
+            raise ValueError(f"Unknown prune_policy: {prune_policy}")
 
-            score = self.edge_mlp(feat).squeeze(-1)  # [B,N,N] logits
-            score = score.float()
-            score_sig = torch.sigmoid(score)
-            knn_idx = score_sig.topk(k=k, dim=-1).indices  # [B,N,k]
-
-            knn_mask = torch.zeros((B, N, N), device=device, dtype=torch.bool)
-            knn_mask.scatter_(2, knn_idx, True)
-            cand_mask = cand_mask | knn_mask
-        if prune_policy == "threshold":
-            hard = (score_sig > tau).float()
-        else:
-            raise ValueError(f"Unknown prune_policy: {prune_policy}, use 'threshold' or 'topk'")
-
+        hard = (score_sig > tau).float()
         w_st = (hard - score_sig).detach() + score_sig
         A = cand_mask * w_st
+
         if A.any():
-            Lsparse = score_sig[A.long()].mean()
+            Lsparse = (score_sig * A.detach().bool()).sum(dim=(1, 2)).mean()
         else:
-            Lsparse = torch.tensor(0.0, device=device)
+            Lsparse = score_sig.new_zeros(())
 
-        eye = torch.eye(N, device=device).unsqueeze(0).expand(B, -1, -1)
-        eye_bool = eye.bool()
-        llm_pos_mask = llm_mask & (~eye_bool)
+        eye_bool = torch.eye(N, device=H.device, dtype=torch.bool)
+        llm_pos_mask = llm_mask & ~eye_bool
         if llm_pos_mask.any():
-            s_pos = score[llm_pos_mask]  # logits
-            y_pos = torch.ones_like(s_pos)  # target=1
-            Lprior = F.binary_cross_entropy_with_logits(s_pos, y_pos, reduction='mean')
+            s_pos = score[llm_pos_mask]
+            Lprior = F.binary_cross_entropy_with_logits(
+                s_pos, torch.ones_like(s_pos), reduction="mean"
+            )
         else:
-            Lprior = torch.tensor(0.0, device=device)
-
-        aux = {
-            "score": score_sig,
-            "hard": hard,
-            "cand_mask": cand_mask,
-            "llm_mask": llm_mask,
-        }
+            Lprior = score.new_zeros(())
 
         return A, Lprior, Lsparse
+
 
     def forward(self, x, target, adj, y=None, table_flag=0):
         encoder_output2 = None
